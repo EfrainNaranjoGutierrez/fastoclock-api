@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: fastoclock-api
+    runtime: docker
+    plan: free
+    envVars:
+      - key: APP_NAME
+        value: FastOclock
+      - key: UMBRAL_ALTA
+        value: "0.75"
+      - key: UMBRAL_MEDIA
+        value: "0.40"
+      - key: UMBRAL_BAJA
+        value: "0.15"
