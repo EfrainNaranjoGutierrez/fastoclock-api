@@ -171,16 +171,16 @@ class DataProcessor:
         return features
 
     def _build_dataset(self, df: pd.DataFrame, features: pd.DataFrame) -> pd.DataFrame:
-    d = df.sort_values(["cliente", "fecha"])
-    d = d.copy()
-    d["next_purchase_date"] = d.groupby("cliente")["fecha"].shift(-1)
-    d["days_to_next"] = (d["next_purchase_date"] - d["fecha"]).dt.days
-    d = d.dropna(subset=["days_to_next"]).copy()
+        d = df.sort_values(["cliente", "fecha"])
+        d = d.copy()
+        d["next_purchase_date"] = d.groupby("cliente")["fecha"].shift(-1)
+        d["days_to_next"] = (d["next_purchase_date"] - d["fecha"]).dt.days
+        d = d.dropna(subset=["days_to_next"]).copy()
 
-    for h in [7, 14, 30, 60]:
-        d[f"recompra_{h}d"] = (d["days_to_next"] <= h).astype(int)
+        for h in [7, 14, 30, 60]:
+            d[f"recompra_{h}d"] = (d["days_to_next"] <= h).astype(int)
 
-    numeric_feat_cols = [c for c in features.select_dtypes(include=["number"]).columns]
-    merge_cols = ["cliente"] + [c for c in numeric_feat_cols if c not in d.columns]
+        numeric_feat_cols = [c for c in features.select_dtypes(include=["number"]).columns]
+        merge_cols = ["cliente"] + [c for c in numeric_feat_cols if c not in d.columns]
 
-    return d.merge(features[merge_cols], on="cliente", how="left")
+        return d.merge(features[merge_cols], on="cliente", how="left")
