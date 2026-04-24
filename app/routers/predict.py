@@ -35,16 +35,16 @@ def _build_interpretation(name, prob30, days, segment, product, interval):
         return (
             f"Con base en nuestro pronóstico, {name} tiene una probabilidad del {prob30:.0%} "
             f"de realizar una nueva compra en los próximos 30 días. Su patrón de compra cada "
-            f"~{interval:.0f} días y su historial con {product} indican que es momento de "
-            f"programar el pedido de forma anticipada. Estimamos que comprará en "
-            f"aproximadamente {days:.0f} días. Segmento: {segment}."
+            f"~{max(interval, 1):.0f} días y su historial con {product} indican que es momento "
+            f"de programar el pedido de forma anticipada. Estimamos que comprará en "
+            f"aproximadamente {max(days, 1):.0f} días. Segmento: {segment}."
         )
     elif prob30 >= settings.UMBRAL_MEDIA:
         return (
             f"Con base en nuestro pronóstico, {name} muestra una probabilidad moderada "
             f"({prob30:.0%}) de recompra en los próximos 30 días. Su producto principal es "
-            f"{product} con un ciclo de ~{interval:.0f} días. Recomendamos contactar al "
-            f"cliente para confirmar sus necesidades. Segmento: {segment}."
+            f"{product} con un ciclo de ~{max(interval, 1):.0f} días. Recomendamos contactar "
+            f"al cliente para confirmar sus necesidades. Segmento: {segment}."
         )
     else:
         return (
@@ -56,19 +56,39 @@ def _build_interpretation(name, prob30, days, segment, product, interval):
 
 
 def _generate_predictions(features: pd.DataFrame, models: dict) -> list:
+    exclude = {"cliente", "primera_compra", "ultima_compra",
+               "cluster", "segmento", "producto_top"}
+
     feature_cols = [
         c for c in features.columns
-        if c not in ("cliente", "primera_compra", "ultima_compra",
-                     "cluster", "segmento", "producto_top")
-        and str(features[c].dtype) in ["float64", "int64", "float32", "int32"]
+        if c not in exclude
+        and pd.api.types.is_numeric_dtype(features[c])
     ]
+
+    scaler = models.get("scaler")
+    n_expected = getattr(scaler, "n_features_in_", None) if scaler else None
+
+    logger.info(f"Feature cols disponibles: {len(feature_cols)}, scaler espera: {n_expected}")
 
     predictions = []
     for _, row in features.iterrows():
         try:
-            X = row[feature_cols].fillna(0).values.reshape(1, -1)
-            if "scaler" in models:
-                X = models["scaler"].transform(X)
+            # Construir vector
+            vals = [float(row[c]) if c in row.index and pd.notna(row[c]) else 0.0
+                    for c in feature_cols]
+
+            # Ajustar longitud al scaler
+            if n_expected is not None:
+                if len(vals) < n_expected:
+                    vals += [0.0] * (n_expected - len(vals))
+                elif len(vals) > n_expected:
+                    vals = vals[:n_expected]
+
+            X = np.array([vals], dtype=np.float64)
+            X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if scaler is not None:
+                X = scaler.transform(X)
 
             probs = {}
             for h in [7, 14, 30, 60]:
@@ -90,7 +110,9 @@ def _generate_predictions(features: pd.DataFrame, models: dict) -> list:
             interval = float(row.get("intervalo_promedio_dias", 0) or 0)
             antiguedad = float(row.get("antiguedad_dias", 1) or 1)
             total_compras = float(row.get("total_compras", 0) or 0)
-            fill = round(min(total_compras / max(antiguedad / max(interval, 1), 1), 1.0) * 100, 1) if interval > 0 else 0
+            fill = round(
+                min(total_compras / max(antiguedad / max(interval, 1), 1), 1.0) * 100, 1
+            ) if interval > 0 else 50.0
 
             predictions.append({
                 "cliente": str(row["cliente"]),
@@ -114,10 +136,12 @@ def _generate_predictions(features: pd.DataFrame, models: dict) -> list:
                     str(row["cliente"]), p30, dias, segment, product, interval
                 ),
             })
+
         except Exception as e:
-            logger.warning(f"Error prediciendo {row.get('cliente', '?')}: {e}")
+            logger.error(f"Error prediciendo {row.get('cliente', '?')}: {e}")
             continue
 
+    logger.info(f"Predicciones generadas: {len(predictions)}/{len(features)}")
     return predictions
 
 
@@ -129,14 +153,16 @@ async def predict_all(
 ):
     try:
         features = find_latest_features(job_id)
-    except FileNotFoundError:
-        raise HTTPException(404, "Features no encontradas. Sube y entrena de nuevo.")
+        logger.info(f"Features cargadas: {len(features)} clientes, {len(features.columns)} cols")
+    except FileNotFoundError as e:
+        raise HTTPException(404, f"Features no encontradas: {str(e)}")
 
     models = _load_models()
     if not models:
         raise HTTPException(400, "Modelos no entrenados.")
 
     predictions = _generate_predictions(features, models)
+
     if not predictions:
         raise HTTPException(500, "No se pudieron generar predicciones.")
 
@@ -158,7 +184,9 @@ async def predict_all(
             "programar_pedido": alta,
             "contactar_cliente": media,
             "reactivar_campana": baja,
-            "fill_rate_promedio": round(np.mean([p["fill_rate"] for p in predictions]), 1),
+            "fill_rate_promedio": round(
+                np.mean([p["fill_rate"] for p in predictions]), 1
+            ),
         },
     }
 
@@ -181,7 +209,9 @@ async def download_predictions(job_id: str):
     return StreamingResponse(
         open(csv_path, "rb"),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=predicciones_{job_id}.csv"},
+        headers={
+            "Content-Disposition": f"attachment; filename=predicciones_{job_id}.csv"
+        },
     )
 
 
@@ -196,16 +226,25 @@ async def threshold_analysis(job_id: str, horizonte: int = 30):
     if f"{horizonte}d" not in models:
         raise HTTPException(400, f"Modelo {horizonte}d no disponible.")
 
+    exclude = {"cliente", "primera_compra", "ultima_compra",
+               "cluster", "segmento", "producto_top"}
     feature_cols = [
         c for c in features.columns
-        if c not in ("cliente", "primera_compra", "ultima_compra",
-                     "cluster", "segmento", "producto_top")
-        and str(features[c].dtype) in ["float64", "int64", "float32", "int32"]
+        if c not in exclude and pd.api.types.is_numeric_dtype(features[c])
     ]
 
-    X = features[feature_cols].fillna(0)
-    if "scaler" in models:
-        X = models["scaler"].transform(X)
+    scaler = models.get("scaler")
+    n_expected = getattr(scaler, "n_features_in_", None) if scaler else None
+
+    X = features[feature_cols].fillna(0).values
+    if n_expected:
+        if X.shape[1] < n_expected:
+            X = np.pad(X, ((0, 0), (0, n_expected - X.shape[1])))
+        elif X.shape[1] > n_expected:
+            X = X[:, :n_expected]
+
+    if scaler:
+        X = scaler.transform(X)
 
     y_prob = models[f"{horizonte}d"].predict_proba(X)[:, 1]
     dummy_y = (y_prob >= 0.5).astype(int)
